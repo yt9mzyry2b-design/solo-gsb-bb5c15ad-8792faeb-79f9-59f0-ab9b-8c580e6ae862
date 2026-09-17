@@ -1,17 +1,28 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Instance } from '../ical-engine/types';
 import { detectConflicts, instanceId } from '../ical-engine/conflicts';
 import type { InstanceChange } from '../ical-engine/diff';
+import type { FreeSlot } from '../ical-engine/free-windows';
 import { formatWall, formatOffset } from '../utils/format';
 import { ChangeImpact } from './ChangeImpact';
+import { FreeWindows } from './FreeWindows';
 
-export type AuditTab = 'visible' | 'cancelled' | 'excluded' | 'impact';
+export type AuditTab = 'visible' | 'cancelled' | 'excluded' | 'impact' | 'free';
+
+/** 点击空闲窗口后，在生效表定位空档前后相邻事件的标记 */
+export interface SlotMark {
+  slotKey: string;
+  slot: FreeSlot;
+  /** 空档查询使用的 IANA 时区，横幅按此时区显示墙钟 */
+  tzid: string;
+  neighborKeys: Set<string>;
+}
 
 interface InstanceTableProps {
   instances: Instance[];
   cancelled: Instance[];
   excluded: Instance[];
-  /** 受控页签（供“变更影响”点击后联动切回生效表） */
+  /** 受控页签（供“变更影响”“空闲窗口”点击后联动切回生效表） */
   tab: AuditTab;
   onTabChange: (tab: AuditTab) => void;
   /** 变更影响比对结果（impact 页签） */
@@ -23,6 +34,15 @@ interface InstanceTableProps {
   ghostInstance: Instance | null;
   selectedKey: string | null;
   onSelect: (inst: Instance) => void;
+  /** 空闲窗口页签参数 */
+  rangeStartUtc: number;
+  rangeEndUtc: number;
+  freeStartDate: string;
+  freeEndDate: string;
+  /** 当前空闲窗口定位标记（点击空档后驱动生效表高亮/滚动/横幅） */
+  slotMark: SlotMark | null;
+  onSelectSlot: (slot: FreeSlot, tzid: string) => void;
+  onDismissSlotMark: () => void;
 }
 
 const SOURCE_LABEL: Record<Instance['source'], string> = {
@@ -44,9 +64,17 @@ export function InstanceTable({
   ghostInstance,
   selectedKey,
   onSelect,
+  rangeStartUtc,
+  rangeEndUtc,
+  freeStartDate,
+  freeEndDate,
+  slotMark,
+  onSelectSlot,
+  onDismissSlotMark,
 }: InstanceTableProps) {
   const [locFilter, setLocFilter] = useState('');
   const [onlyConflicts, setOnlyConflicts] = useState(false);
+  const rowRefs = useRef<Map<string, HTMLTableRowElement>>(new Map());
 
   const conflicts = useMemo(() => detectConflicts(instances), [instances]);
 
@@ -58,7 +86,7 @@ export function InstanceTable({
   }, [tab, instances, cancelled, excluded]);
 
   const filteredRows = useMemo(() => {
-    if (tab === 'impact') return [];
+    if (tab === 'impact' || tab === 'free') return [];
     const q = locFilter.trim().toLowerCase();
     return rows.filter((i) => {
       if (q && !i.location.toLowerCase().includes(q) && !i.summary.toLowerCase().includes(q)) {
@@ -93,6 +121,15 @@ export function InstanceTable({
     return map;
   }, [instances]);
 
+  // 点击空档切到生效表后，把前邻（优先）滚动到可视区
+  useEffect(() => {
+    if (tab !== 'visible' || !slotMark) return;
+    const focus = slotMark.slot.prev ?? slotMark.slot.next;
+    if (!focus) return;
+    const el = rowRefs.current.get(instanceId(focus));
+    el?.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+  }, [tab, slotMark]);
+
   return (
     <>
       <div className="tabs">
@@ -105,6 +142,9 @@ export function InstanceTable({
         <button className={tab === 'excluded' ? 'active' : ''} onClick={() => onTabChange('excluded')}>
           已排除（{excluded.length}）
         </button>
+        <button className={tab === 'free' ? 'active' : ''} onClick={() => onTabChange('free')}>
+          空闲窗口
+        </button>
         <button className={tab === 'impact' ? 'active' : ''} onClick={() => onTabChange('impact')}>
           变更影响{changes.length > 0 ? `（${changes.length}）` : ''}
         </button>
@@ -116,8 +156,26 @@ export function InstanceTable({
           selectedIdentity={selectedIdentity}
           onSelectChange={onSelectChange}
         />
+      ) : tab === 'free' ? (
+        <FreeWindows
+          instances={instances}
+          rangeStartUtc={rangeStartUtc}
+          rangeEndUtc={rangeEndUtc}
+          initialStartDate={freeStartDate}
+          initialEndDate={freeEndDate}
+          selectedSlotKey={slotMark?.slotKey ?? null}
+          selectedNeighborKeys={slotMark?.neighborKeys ?? new Set()}
+          onSelectSlot={onSelectSlot}
+          onSelectInstance={(inst) => {
+            onTabChange('visible');
+            onSelect(inst);
+          }}
+        />
       ) : (
         <>
+          {tab === 'visible' && slotMark && (
+            <SlotBanner mark={slotMark} onSelect={onSelect} onDismiss={onDismissSlotMark} />
+          )}
           <div className="filter-bar">
             <input
               type="text"
@@ -164,15 +222,26 @@ export function InstanceTable({
                   base !== null &&
                   inst.utcOffsetSec !== base;
                 const isGhost = !!ghostInstance && id === instanceId(ghostInstance);
+                const neighborTone = slotMark?.neighborKeys.has(id)
+                  ? slotMark.slot.prev && instanceId(slotMark.slot.prev) === id
+                    ? 'prev'
+                    : 'next'
+                  : undefined;
                 return (
                   <tr
                     key={`${tab}-${id}`}
+                    ref={(el) => {
+                      if (el) rowRefs.current.set(id, el);
+                      else rowRefs.current.delete(id);
+                    }}
                     className={[
                       'instance-row',
                       tab === 'visible' ? '' : `audit-row ${tab}`,
                       peers ? 'conflict' : '',
                       selectedKey === id ? 'selected' : '',
                       isGhost ? 'ghost-removed' : '',
+                      neighborTone === 'prev' ? 'slot-neighbor-prev' : '',
+                      neighborTone === 'next' ? 'slot-neighbor-next' : '',
                     ].join(' ')}
                     onClick={() => onSelect(inst)}
                     title={isGhost ? '该实例在当前生效列表中已被移除（来自变更影响联动）' : undefined}
@@ -264,5 +333,44 @@ export function InstanceTable({
         </>
       )}
     </>
+  );
+}
+
+function SlotBanner({
+  mark,
+  onSelect,
+  onDismiss,
+}: {
+  mark: SlotMark;
+  onSelect: (inst: Instance) => void;
+  onDismiss: () => void;
+}) {
+  const { slot } = mark;
+  return (
+    <div className="slot-banner">
+      <span>
+        🪟 空档 <b>{slot.date}</b> {formatWall(slot.startUtc, mark.tzid, false).slice(11)}–
+        {formatWall(slot.endUtc, mark.tzid, false).slice(11)}（{slot.minutes} 分钟 ·{' '}
+        {formatOffset(slot.offsetSec)}）
+      </span>
+      <span style={{ flex: 1 }} />
+      {slot.prev ? (
+        <button className="ghost" onClick={() => onSelect(slot.prev!)}>
+          定位前邻：{slot.prev.summary || '（无标题）'}
+        </button>
+      ) : (
+        <span className="clock">无前邻</span>
+      )}
+      {slot.next ? (
+        <button className="ghost" onClick={() => onSelect(slot.next!)}>
+          定位后邻：{slot.next.summary || '（无标题）'}
+        </button>
+      ) : (
+        <span className="clock">无后邻</span>
+      )}
+      <button className="ghost slot-banner-close" onClick={onDismiss} title="清除定位标记">
+        ✕
+      </button>
+    </div>
   );
 }

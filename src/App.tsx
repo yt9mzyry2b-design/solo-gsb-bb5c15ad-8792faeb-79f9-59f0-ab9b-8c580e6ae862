@@ -14,8 +14,10 @@ import type {
   Warning,
 } from './ical-engine/types';
 import { SourceView } from './components/SourceView';
-import { InstanceTable, type AuditTab } from './components/InstanceTable';
+import { InstanceTable, type AuditTab, type SlotMark } from './components/InstanceTable';
 import { SeriesPanel } from './components/SeriesPanel';
+import type { FreeSlot } from './ical-engine/free-windows';
+import { slotKey } from './components/FreeWindows';
 import { addDays, downloadText, localMidnightUtcSec, ymd } from './utils/format';
 
 type ParseOutcome =
@@ -56,6 +58,8 @@ export default function App() {
   const [rightTab, setRightTab] = useState<AuditTab>('visible');
   /** 变更影响联动：被移除实例以幽灵行进入生效表 */
   const [ghostInstance, setGhostInstance] = useState<Instance | null>(null);
+  /** 空闲窗口联动：点击空档后在生效表高亮/定位前后相邻事件 */
+  const [slotMark, setSlotMark] = useState<SlotMark | null>(null);
 
   const reparse = useCallback((text: string): ParseOutcome => {
     const result = parseCalendar(text);
@@ -75,6 +79,7 @@ export default function App() {
     setEditedRrule({});
     setSelection(EMPTY_SELECTION);
     setGhostInstance(null);
+    setSlotMark(null);
     return next;
   }, []);
 
@@ -106,9 +111,10 @@ export default function App() {
     });
   }, [outcome, range]);
 
-  // 调整日期范围后立即重算，并清除上一范围联动出的幽灵行
+  // 调整日期范围后立即重算，并清除上一范围联动出的幽灵行与空档定位
   useEffect(() => {
     setGhostInstance(null);
+    setSlotMark(null);
   }, [startDate, endDate]);
 
   // 变更影响：基线生效实例 vs 当前编辑状态下的生效实例
@@ -160,6 +166,7 @@ export default function App() {
     (inst: Instance, ghost: Instance | null = null) => {
       const peers = conflicts?.byKey.get(instanceId(inst)) ?? [];
       setGhostInstance(ghost);
+      setSlotMark(null);
       setSelection({
         instanceKey: instanceId(inst),
         seriesId: inst.seriesId,
@@ -190,6 +197,31 @@ export default function App() {
     },
     [selectInstance]
   );
+
+  // 点击空闲窗口：切到生效表，高亮并定位前邻（优先）/后邻
+  const selectFreeSlot = useCallback((slot: FreeSlot, tzid: string) => {
+    const focus = slot.prev ?? slot.next;
+    const neighborKeys = new Set<string>();
+    if (slot.prev) neighborKeys.add(instanceId(slot.prev));
+    if (slot.next) neighborKeys.add(instanceId(slot.next));
+    setSlotMark({ slotKey: slotKey(slot), slot, tzid, neighborKeys });
+    setGhostInstance(null);
+    setRightTab('visible');
+    if (focus) {
+      const peers = conflicts?.byKey.get(instanceId(focus)) ?? [];
+      setSelection({
+        instanceKey: instanceId(focus),
+        seriesId: focus.seriesId,
+        overrideId: focus.override?.id ?? null,
+        conflictRanges: peers.map((p) => ({
+          start: p.overrideRange?.start ?? p.masterRange.start,
+          end: p.overrideRange?.end ?? p.masterRange.end,
+          kind: 'conflict' as const,
+        })),
+        token: `slot-${slotKey(slot)}`,
+      });
+    }
+  }, [conflicts]);
 
   const focusSeries = useCallback((m: MasterSeries) => {
     setSelection({
@@ -474,6 +506,13 @@ export default function App() {
               ghostInstance={activeGhost}
               selectedKey={selection.instanceKey}
               onSelect={selectInstance}
+              rangeStartUtc={range!.startUtc}
+              rangeEndUtc={range!.endUtc}
+              freeStartDate={startDate}
+              freeEndDate={endDate}
+              slotMark={slotMark}
+              onSelectSlot={selectFreeSlot}
+              onDismissSlotMark={() => setSlotMark(null)}
             />
           ) : (
             <div className="empty-hint">

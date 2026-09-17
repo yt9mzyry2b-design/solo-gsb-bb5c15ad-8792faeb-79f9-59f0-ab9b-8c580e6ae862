@@ -5,6 +5,8 @@ import { expandAll } from '../src/ical-engine/expansion';
 import { detectConflicts, instanceId } from '../src/ical-engine/conflicts';
 import { diffInstances, instanceIdentity } from '../src/ical-engine/diff';
 import { normalizeCalendar } from '../src/ical-engine/normalizer';
+import { collectLocations, computeFreeWindows } from '../src/ical-engine/free-windows';
+import { dayStartUtcSec, wallToUtcSec } from '../src/utils/localtime';
 
 const ICS = `BEGIN:VCALENDAR
 VERSION:2.0
@@ -287,6 +289,253 @@ assert.ok(norm3.ics.includes('FREQ=WEEKLY;COUNT=2'), 'edited rrule exported');
 // round-trip parse of normalized output
 const reparsed = parseCalendar(norm.ics);
 assert.ok(!('fatal' in reparsed), 'normalized output reparses');
+
+// ================= 空闲窗口 =================
+
+const FW_ICS = `BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test-FW//
+BEGIN:VTIMEZONE
+TZID:America/New_York
+BEGIN:DAYLIGHT
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+TZNAME:EDT
+DTSTART:19700308T020000
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+TZNAME:EST
+DTSTART:19701101T020000
+RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:fw-daily@x
+SUMMARY:每日站会
+LOCATION:FW-Room
+DTSTART;TZID=America/New_York:20260305T090000
+DTEND;TZID=America/New_York:20260305T093000
+RRULE:FREQ=DAILY;COUNT=7
+END:VEVENT
+BEGIN:VEVENT
+UID:fw-lunch@x
+SUMMARY:午间评审（与站会首尾相接）
+LOCATION:FW-Room
+DTSTART;TZID=America/New_York:20260306T093000
+DTEND;TZID=America/New_York:20260306T103000
+END:VEVENT
+BEGIN:VEVENT
+UID:fw-overnight@x
+SUMMARY:跨日部署窗口（3/7 22:00 → 3/8 06:00，跨 DST 切换）
+LOCATION:FW-Room
+DTSTART;TZID=America/New_York:20260307T220000
+DTEND;TZID=America/New_York:20260308T060000
+END:VEVENT
+BEGIN:VEVENT
+UID:fw-allday@x
+SUMMARY:全天占用
+LOCATION:FW-Room
+DTSTART;VALUE=DATE:20260310
+DTEND;VALUE=DATE:20260311
+END:VEVENT
+BEGIN:VEVENT
+UID:fw-daily@x
+STATUS:CANCELLED
+DTSTART;TZID=America/New_York:20260309T090000
+DTEND;TZID=America/New_York:20260309T093000
+RECURRENCE-ID;TZID=America/New_York:20260309T090000
+END:VEVENT
+BEGIN:VEVENT
+UID:fw-other-loc@x
+SUMMARY:别的房间（不参与）
+LOCATION:Other-Room
+DTSTART;TZID=America/New_York:20260305T140000
+DTEND;TZID=America/New_York:20260305T150000
+END:VEVENT
+END:VCALENDAR
+`;
+
+const fwParsed = parseCalendar(FW_ICS);
+assert.ok(!('fatal' in fwParsed), 'free-window sample parses');
+if (!('fatal' in fwParsed)) {
+  const fwRange = {
+    startUtc: Date.UTC(2026, 2, 3) / 1000,
+    endUtc: Date.UTC(2026, 2, 15) / 1000,
+  };
+  const fwExp = expandAll(fwParsed.masters, fwRange, {
+    disabledOverrides: new Set(),
+    editedRrule: {},
+  });
+
+  // DST 日界：3/8（春季跳表日）00:00 EST = 05:00Z；3/9 00:00 EDT = 04:00Z，该日 23h
+  assert.strictEqual(
+    dayStartUtcSec('America/New_York', 2026, 3, 8),
+    Date.UTC(2026, 2, 8, 5) / 1000,
+    'day start on spring-forward day uses EST midnight (05:00Z)'
+  );
+  assert.strictEqual(
+    dayStartUtcSec('America/New_York', 2026, 3, 9),
+    Date.UTC(2026, 2, 9, 4) / 1000,
+    'day start after spring-forward uses EDT midnight (04:00Z)'
+  );
+  assert.strictEqual(
+    dayStartUtcSec('America/New_York', 2026, 3, 9) - dayStartUtcSec('America/New_York', 2026, 3, 8),
+    23 * 3600,
+    'spring-forward local day is 23h, not fixed 24h'
+  );
+  assert.strictEqual(
+    wallToUtcSec('America/New_York', 2026, 3, 8, 9, 0, 0),
+    Date.UTC(2026, 2, 8, 13) / 1000,
+    '09:00 EDT on DST day = 13:00Z'
+  );
+
+  const fw = computeFreeWindows(fwExp.instances, {
+    location: 'FW-Room',
+    tzid: 'America/New_York',
+    startDate: '2026-03-05',
+    endDate: '2026-03-10',
+    workStart: '09:00',
+    workEnd: '18:00',
+    minMinutes: 30,
+  });
+  assert.ok(!fw.error, 'no query error');
+
+  // 3/5：忙碌 09:00–09:30，空档 09:30–18:00
+  const d5 = fw.slots.filter((s) => s.date === '2026-03-05');
+  assert.strictEqual(d5.length, 1, 'one slot on Mar 5');
+  assert.strictEqual(d5[0].startUtc, Date.UTC(2026, 2, 5, 14, 30) / 1000, 'Mar 5 gap starts 09:30 EST');
+  assert.strictEqual(d5[0].minutes, 510, 'Mar 5 gap 8.5h');
+  assert.strictEqual(d5[0].prev?.summary, '每日站会', 'prev neighbor = standup');
+  assert.strictEqual(d5[0].next, null, 'no next neighbor at work-end');
+
+  // 3/6：09:00–10:30 合并（站会 09:00–09:30 与评审 09:30–10:30 首尾相接），空档 10:30–18:00
+  const d6 = fw.slots.filter((s) => s.date === '2026-03-06');
+  assert.strictEqual(d6.length, 1, 'one slot on Mar 6');
+  assert.strictEqual(d6[0].startUtc, Date.UTC(2026, 2, 6, 15, 30) / 1000, 'abutting events merged, gap 10:30 EST');
+  assert.strictEqual(d6[0].prev?.summary, '午间评审（与站会首尾相接）', 'prev neighbor = later ending abutting event');
+
+  // 3/8 DST 日：跨日事件裁到 00:00–06:00（工作时段之外），站会 09:00–09:30 EDT
+  const d8 = fw.slots.filter((s) => s.date === '2026-03-08');
+  assert.strictEqual(d8.length, 1, 'one slot on Mar 8 (DST day)');
+  assert.strictEqual(d8[0].dayLengthSec, 23 * 3600, 'slot tagged 23h DST day');
+  assert.strictEqual(d8[0].offsetSec, -4 * 3600, 'EDT -04:00 on Mar 8');
+  assert.strictEqual(d8[0].startUtc, Date.UTC(2026, 2, 8, 13, 30) / 1000, 'Mar 8 gap 09:30 EDT = 13:30Z');
+  assert.strictEqual(d8[0].endUtc, Date.UTC(2026, 2, 8, 22) / 1000, 'Mar 8 work end 18:00 EDT = 22:00Z');
+  assert.strictEqual(d8[0].minutes, 510, 'DST-day gap still 8.5 wall hours');
+  // 跨日事件在工作时段前结束（06:00），不作为该空档前邻（与 09:30 不相接）
+  assert.strictEqual(d8[0].prev?.summary, '每日站会', 'overnight event not adjacent to 09:30 gap');
+
+  // 3/10：全天事件整日占用，无空档
+  assert.strictEqual(fw.slots.filter((s) => s.date === '2026-03-10').length, 0, 'all-day event blocks whole day');
+
+  // 3/9 站会被 CANCELLED 例外取消：生效忙碌集不含该实例，工作时段整日空闲（无相邻忙碌事件）
+  const d9 = fw.slots.filter((s) => s.date === '2026-03-09');
+  assert.strictEqual(d9.length, 1, 'one slot on Mar 9');
+  assert.strictEqual(d9[0].minutes, 540, 'cancelled standup leaves full work-day gap');
+  assert.strictEqual(d9[0].prev, null, 'cancelled instance is not a busy neighbor');
+
+  // 停用该 CANCELLED 例外：3/9 站会恢复生效，空档回缩到 09:30–18:00（实时重算）
+  const fwDaily = fwParsed.masters.find((mm) => mm.uid === 'fw-daily@x')!;
+  const cancelOv = fwDaily.overrides.find((o) => o.cancelled)!;
+  const fwRestored = expandAll(fwParsed.masters, fwRange, {
+    disabledOverrides: new Set([cancelOv.id]),
+    editedRrule: {},
+  });
+  const fw3 = computeFreeWindows(fwRestored.instances, {
+    location: 'FW-Room',
+    tzid: 'America/New_York',
+    startDate: '2026-03-09',
+    endDate: '2026-03-09',
+    workStart: '09:00',
+    workEnd: '18:00',
+    minMinutes: 30,
+  });
+  assert.strictEqual(fw3.slots.length, 1, 'one slot after cancellation override disabled');
+  assert.strictEqual(fw3.slots[0].minutes, 510, 'restored standup shrinks gap to 510 min');
+  assert.strictEqual(fw3.slots[0].prev?.summary, '每日站会', 'restored instance becomes prev neighbor');
+
+  // 总空档数（3/5..3/9 各 1，3/10 为 0）
+  assert.strictEqual(fw.slots.length, 5, 'five slots across Mar 5–9');
+  // 列表按日期、开始时间排序
+  for (let i = 1; i < fw.slots.length; i++) {
+    assert.ok(fw.slots[i].startUtc >= fw.slots[i - 1].startUtc, 'slots sorted by start');
+  }
+
+  // 最小分钟数过滤：480 分钟时 3/5、3/7、3/8（510）、3/9（540，取消整日空闲）入选，3/6（450）淘汰
+  const fwLong = computeFreeWindows(fwExp.instances, {
+    location: 'FW-Room',
+    tzid: 'America/New_York',
+    startDate: '2026-03-05',
+    endDate: '2026-03-10',
+    workStart: '09:00',
+    workEnd: '18:00',
+    minMinutes: 480,
+  });
+  assert.strictEqual(fwLong.slots.length, 4, 'minMinutes filters short gaps');
+
+  // LOCATION 精确隔离：Other-Room 独立计算
+  assert.deepStrictEqual(
+    collectLocations(fwExp.instances).sort(),
+    ['FW-Room', 'Other-Room'],
+    'locations collected'
+  );
+  const other = computeFreeWindows(fwExp.instances, {
+    location: 'Other-Room',
+    tzid: 'America/New_York',
+    startDate: '2026-03-05',
+    endDate: '2026-03-05',
+    workStart: '09:00',
+    workEnd: '18:00',
+    minMinutes: 30,
+  });
+  // Other-Room 仅 14:00–15:00 占用 → 09:00–14:00 与 15:00–18:00 两个空档
+  assert.strictEqual(other.slots.length, 2, 'other location computed independently');
+  assert.strictEqual(other.slots[0].next?.summary, '别的房间（不参与）', 'next neighbor within location');
+
+  // 参数校验
+  assert.ok(computeFreeWindows(fwExp.instances, {
+    location: '', tzid: 'America/New_York', startDate: '2026-03-05', endDate: '2026-03-05',
+    workStart: '09:00', workEnd: '18:00', minMinutes: 30,
+  }).error, 'empty location rejected');
+  assert.ok(computeFreeWindows(fwExp.instances, {
+    location: 'FW-Room', tzid: 'Bad/Zone', startDate: '2026-03-05', endDate: '2026-03-05',
+    workStart: '09:00', workEnd: '18:00', minMinutes: 30,
+  }).error, 'bad tzid rejected');
+  assert.ok(computeFreeWindows(fwExp.instances, {
+    location: 'FW-Room', tzid: 'America/New_York', startDate: '2026-03-05', endDate: '2026-03-05',
+    workStart: '18:00', workEnd: '09:00', minMinutes: 30,
+  }).error, 'inverted work window rejected');
+
+  // 停用/编辑实时重算：把每日站会规则清空（主事件退化为 3/5 单次实例）后重算，
+  // 3/7 工作时段不再有站会（跨日事件 06:00 结束，在工作时段之外），整日空闲、前后邻均为 null
+  const fwEdited = expandAll(fwParsed.masters, fwRange, {
+    disabledOverrides: new Set(),
+    editedRrule: { 'fw-daily@x': '' },
+  });
+  const fw2 = computeFreeWindows(fwEdited.instances, {
+    location: 'FW-Room',
+    tzid: 'America/New_York',
+    startDate: '2026-03-05',
+    endDate: '2026-03-08',
+    workStart: '09:00',
+    workEnd: '18:00',
+    minMinutes: 30,
+  });
+  const d7 = fw2.slots.filter((s) => s.date === '2026-03-07');
+  assert.strictEqual(d7.length, 1, 'Mar 7 recomputed: one free slot after rule cleared');
+  assert.strictEqual(d7[0].minutes, 540, '09:00–18:00 = 540 minutes');
+  assert.strictEqual(d7[0].prev, null, 'event ending before work window is not prev neighbor');
+  assert.strictEqual(d7[0].next?.summary, '跨日部署窗口（3/7 22:00 → 3/8 06:00，跨 DST 切换）',
+    'overnight event starting at 22:00 is next neighbor of the work-hours gap');
+  // 3/5 站会作为单次事件仍在
+  const d5b = fw2.slots.filter((s) => s.date === '2026-03-05');
+  assert.strictEqual(d5b.length, 1);
+  assert.strictEqual(d5b[0].minutes, 510, 'single instance remains after rule cleared');
+  assert.strictEqual(d5b[0].prev?.summary, '每日站会');
+}
 
 console.log('✓ all engine smoke tests passed');
 console.log(`  instances=${expanded.instances.length} cancelled=${expanded.cancelled.length} excluded=${expanded.excluded.length} conflictGroups=${conflicts.groups.length}`);

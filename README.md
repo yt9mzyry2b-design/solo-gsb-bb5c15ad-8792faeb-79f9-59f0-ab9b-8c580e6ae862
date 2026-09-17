@@ -18,7 +18,8 @@
 | 跨 DST | 在事件**声明的 TZID 墙钟空间**迭代，墙钟时刻恒定，UTC 随偏移自动平移并标注 DST |
 | 缺失时区兜底 | ICS 未携带 VTIMEZONE 时，用浏览器 `Intl` 时区数据库自动合成（含 DST 切换点） |
 | 地点冲突 | 按相同非空 `LOCATION` 检测半开区间重叠，相切不算冲突 |
-| 联动定位 | 点击实例/冲突/告警，右侧原始 ICS 高亮所属主事件块、RECURRENCE-ID 块与原始行号 |
+| 空闲窗口 | 基于当前生效实例，按 LOCATION + IANA 时区 + 日期范围 + 每日工作时段计算可容纳指定分钟数的空档；跨日事件按真实本地日界裁剪（DST 日 23/25 小时），忙碌区间相交或首尾相接即合并 |
+| 联动定位 | 点击实例/冲突/告警/空档，右侧原始 ICS 高亮所属主事件块、RECURRENCE-ID 块与原始行号 |
 | 例外停用 | 勾选框即时停用任意一条例外（含 CANCELLED），原实例立即恢复并重算冲突 |
 | 规则编辑 | 就地修改 RRULE 文本，合法即实时重算；非法时显示解析错误并回退到上一条有效规则 |
 | 变更影响 | 以 **UID + 原始 recurrence key** 为实例身份，比对原始日历与编辑后的生效实例：新增 / 移除 / 开始·结束移动 / 标题·地点·状态变化逐项列出前后值；移动不会误报成一删一增。支持按变更类型筛选，点击差异项联动实例表与 ICS 源码定位，无改动时显示空状态 |
@@ -36,6 +37,8 @@ docker compose up -d --build
 
 > **http://localhost:8080**
 
+打开右栏「**空闲窗口**」页签即可使用空档查找（无需任何额外服务，纯前端静态托管）。
+
 停止：
 
 ```bash
@@ -50,7 +53,7 @@ docker compose down
 docker compose -f docker-compose.dev.yml up
 ```
 
-访问 **http://localhost:5173**。
+访问 **http://localhost:5173**，修改 `src/` 即时热更新。
 
 ## 本地开发（无 Docker）
 
@@ -66,7 +69,7 @@ npm run dev        # http://localhost:5173
 ```bash
 npm run build      # 类型检查 + 生产构建到 dist/
 npm run preview    # 本地预览生产构建 http://localhost:4173
-npm run smoke      # 引擎语义冒烟测试（RRULE/RDATE/EXDATE/覆盖/取消/DST/冲突/导出）
+npm run smoke      # 引擎语义冒烟测试（RRULE/RDATE/EXDATE/覆盖/取消/DST/冲突/空闲窗口/导出）
 ```
 
 ## 使用指引
@@ -78,13 +81,19 @@ npm run smoke      # 引擎语义冒烟测试（RRULE/RDATE/EXDATE/覆盖/取消
      红框=冲突方事件块，高亮行=RRULE/RDATE/EXDATE/RECURRENCE-ID 原始行）。
    - **中栏**：每个 UID 一张规则卡，可编辑 RRULE、勾选停用具条例外，并显示
      RDATE/EXDATE 清单与行号。
-   - **右栏**：实例表四个页签——生效 / 已取消 / 已排除 / **变更影响**；生效表支持地点关键字过滤与
+   - **右栏**：实例表五个页签——生效 / 已取消 / 已排除 / **空闲窗口** / **变更影响**；生效表支持地点关键字过滤与
      「仅看冲突」。「变更影响」比较原始日历与当前编辑（RRULE 修改、例外停用）后的差异，可按
      新增 / 移除 / 移动 / 字段变化筛选，重解析或调整日期范围后立即重算。DST 标记表示该实例相对
      序列首个实例的 UTC 偏移已变化。
 4. 点击任一实例或差异项：右表选中、左栏原文同步定位；有冲突时冲突方事件块同步红框高亮。
    被移除的实例在生效表中以「已移除」幽灵行展示，仍可定位其原始块与行号。
-5. 点右上「导出规范化 ICS」下载 `normalized.ics`，或「复制 ICS」到剪贴板。
+5. **空闲窗口**：在页签内选择 `LOCATION`（下拉取生效实例中的非空地点）、IANA 时区（支持手输，
+   如 `America/New_York`，默认浏览器时区）、日期范围、每日工作时段（墙钟 HH:MM，暂不支持跨午夜）
+   与空档最小分钟数。列表按日期、开始时间排序，显示所选时区墙钟、UTC 偏移；跨 DST 的日期标注
+   `DST 23h/25h`。点击任一空档：自动切回「生效实例」并高亮、滚动定位其**前 / 后相邻事件**
+   （青色=前邻、紫色=后邻），顶部横幅可再次跳转或清除标记；行内相邻事件链接也可直接点击定位。
+   规则编辑、例外停用或展开范围变化后空档立即重算（查询条件保留）。
+6. 点右上「导出规范化 ICS」下载 `normalized.ics`，或「复制 ICS」到剪贴板。
 
 ## 语义约定
 
@@ -97,6 +106,15 @@ npm run smoke      # 引擎语义冒烟测试（RRULE/RDATE/EXDATE/覆盖/取消
 - **RDATE-PERIOD**：使用 PERIOD 自带的结束时间反推该实例时长。
 - **无 DTEND/DURATION**：非全天事件时长按 0 处理，全天事件按 1 天处理（并告警提示）。
 - **冲突**：只比较当前生效实例；全天事件参与检测；无 LOCATION 的事件不参与。
+- **空闲窗口**：
+  - 忙碌集仅包含当前**生效实例**（已取消 / 已排除 / 幽灵行不参与）且 `LOCATION` trim 后与所选值精确相等。
+  - 跨日事件先按**所选 IANA 时区**裁剪到每个本地日 `[00:00, 次日00:00)`，再与当日工作时段求交；
+    本地日界用真实偏移换算，跨 DST 日为 23/25 小时，绝不固定按 86400 秒。
+  - 忙碌区间为半开区间，**相交或首尾相接**（下一个起点 ≤ 上一个终点）即合并，因此相切事件之间
+    不会出现 0 分钟空档；空档 = 工作时段 − 合并后忙碌区间，长度 ≥ 最小分钟数才列出。
+  - 相邻事件按“裁剪到当日的区间”判定：前邻为当日终点 ≤ 空档起点中结束最晚者，后邻为当日起点
+    ≥ 空档终点中开始最早者；工作时段起点之前结束（不相接）的事件不计为前邻。
+  - 每日工作时段为同一本地日内的墙钟区间，暂不支持跨午夜；日期范围上限一年。
 - **合成 VTIMEZONE**：基于展开时间窗（DTSTART/UNTIL 年份前后取余量）探测 DST 切换点，
   仅保证窗内精确；导出的 ICS 建议在目标日历客户端复验。
 - 暂不支持 `RECURRENCE-ID;RANGE=THISANDFUTURE`（按单实例覆盖处理并给出告警）。
@@ -110,12 +128,15 @@ src/
 │   ├── timezones.ts    # Intl 探测 DST 切换点，合成 VTIMEZONE
 │   ├── expansion.ts    # RRULE 迭代 + RDATE/EXDATE/覆盖/取消 + 范围与上限
 │   ├── conflicts.ts    # LOCATION 维度半开区间重叠检测
+│   ├── free-windows.ts # 空闲窗口：跨日裁剪（真实 DST 日界）+ 忙碌区间合并 + 相邻事件
 │   ├── diff.ts         # 变更影响：UID+原始 recurrence key 身份比对（新增/移除/移动/字段）
 │   ├── normalizer.ts   # 规范化 ICS 输出（排序、时区内聚、规则/停用生效）
 │   ├── types.ts        # 领域模型
 │   └── samples.ts      # 内置示例
-├── components/         # SourceView / InstanceTable / SeriesPanel / ChangeImpact
-├── utils/format.ts
+├── components/         # SourceView / InstanceTable / SeriesPanel / ChangeImpact / FreeWindows
+├── utils/
+│   ├── format.ts       # 墙钟/时长格式化与日期工具
+│   └── localtime.ts    # IANA 时区墙钟⇄UTC、真实本地日界（DST 23/25h）
 ├── App.tsx
 └── main.tsx
 scripts/smoke.ts        # 引擎端到端冒烟测试
