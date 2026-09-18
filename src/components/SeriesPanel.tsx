@@ -137,14 +137,16 @@ export function SeriesPanel({
                   <label
                     className="oi-main"
                     onClick={(e) => {
+                      // 阻止冒泡到外层 override-item（点击勾选/文字不应触发源码定位）；
+                      // 实际停用切换只由 checkbox 的 onChange 承担，避免点框时事件冒泡导致重复切换。
                       e.stopPropagation();
-                      onToggleOverride(ov.id);
                     }}
                     title={off ? '勾选以重新启用该例外' : '取消勾选以停用该例外（恢复原实例）'}
                   >
                     <input
                       type="checkbox"
                       checked={!off}
+                      onClick={(e) => e.stopPropagation()}
                       onChange={() => onToggleOverride(ov.id)}
                     />{' '}
                     {ov.cancelled ? 'CANCELLED' : '覆盖'} ·{' '}

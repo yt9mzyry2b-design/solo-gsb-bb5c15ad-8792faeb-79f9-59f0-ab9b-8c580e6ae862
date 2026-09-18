@@ -1,17 +1,19 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Instance } from '../ical-engine/types';
 import { detectConflicts, instanceId } from '../ical-engine/conflicts';
 import type { InstanceChange } from '../ical-engine/diff';
 import { formatWall, formatOffset } from '../utils/format';
 import { ChangeImpact } from './ChangeImpact';
+import { FreeWindows } from './FreeWindows';
+import type { FreeSlot } from '../ical-engine/freewindows';
 
-export type AuditTab = 'visible' | 'cancelled' | 'excluded' | 'impact';
+export type AuditTab = 'visible' | 'cancelled' | 'excluded' | 'impact' | 'free';
 
 interface InstanceTableProps {
   instances: Instance[];
   cancelled: Instance[];
   excluded: Instance[];
-  /** 受控页签（供“变更影响”点击后联动切回生效表） */
+  /** 受控页签（供“变更影响”/“空闲窗口”点击后联动切回生效表） */
   tab: AuditTab;
   onTabChange: (tab: AuditTab) => void;
   /** 变更影响比对结果（impact 页签） */
@@ -23,6 +25,13 @@ interface InstanceTableProps {
   ghostInstance: Instance | null;
   selectedKey: string | null;
   onSelect: (inst: Instance) => void;
+  /** 空闲窗口：顶部展开范围默认值（跟随其初始化 / “同步”按钮） */
+  rangeStartDate: string;
+  rangeEndDate: string;
+  /** 空闲窗口点击空档：切到生效表并选中其前 / 后相邻事件 */
+  onSelectSlot: (slot: FreeSlot, neighbor: Instance | null) => void;
+  /** 空闲窗口联动的定位标记：每次请求自增，触发生效表滚动 */
+  spotlightToken: number;
 }
 
 const SOURCE_LABEL: Record<Instance['source'], string> = {
@@ -44,9 +53,21 @@ export function InstanceTable({
   ghostInstance,
   selectedKey,
   onSelect,
+  rangeStartDate,
+  rangeEndDate,
+  onSelectSlot,
+  spotlightToken,
 }: InstanceTableProps) {
   const [locFilter, setLocFilter] = useState('');
   const [onlyConflicts, setOnlyConflicts] = useState(false);
+  const selectedRowRef = useRef<HTMLTableRowElement | null>(null);
+
+  // 空闲窗口联动定位：页签切到生效表且 token 变化时，滚动到被选中的相邻事件行
+  useEffect(() => {
+    if (tab === 'visible' && spotlightToken > 0) {
+      selectedRowRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, [tab, spotlightToken]);
 
   const conflicts = useMemo(() => detectConflicts(instances), [instances]);
 
@@ -108,6 +129,24 @@ export function InstanceTable({
         <button className={tab === 'impact' ? 'active' : ''} onClick={() => onTabChange('impact')}>
           变更影响{changes.length > 0 ? `（${changes.length}）` : ''}
         </button>
+        <button className={tab === 'free' ? 'active' : ''} onClick={() => onTabChange('free')}>
+          空闲窗口
+        </button>
+      </div>
+
+      {/* 始终挂载以保留表单条件（时区/工作时段等）；非空闲页签时隐藏 */}
+      <div
+        className="free-host"
+        style={{ display: tab === 'free' ? 'flex' : 'none' }}
+        aria-hidden={tab !== 'free'}
+      >
+        <FreeWindows
+          instances={instances}
+          defaultStartDate={rangeStartDate}
+          defaultEndDate={rangeEndDate}
+          selectedKey={selectedKey}
+          onSelectSlot={onSelectSlot}
+        />
       </div>
 
       {tab === 'impact' ? (
@@ -167,12 +206,14 @@ export function InstanceTable({
                 return (
                   <tr
                     key={`${tab}-${id}`}
+                    ref={tab === 'visible' && selectedKey === id ? selectedRowRef : undefined}
                     className={[
                       'instance-row',
                       tab === 'visible' ? '' : `audit-row ${tab}`,
                       peers ? 'conflict' : '',
                       selectedKey === id ? 'selected' : '',
                       isGhost ? 'ghost-removed' : '',
+                      spotlightToken > 0 && selectedKey === id ? 'spotlight' : '',
                     ].join(' ')}
                     onClick={() => onSelect(inst)}
                     title={isGhost ? '该实例在当前生效列表中已被移除（来自变更影响联动）' : undefined}

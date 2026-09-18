@@ -16,6 +16,7 @@ import type {
 import { SourceView } from './components/SourceView';
 import { InstanceTable, type AuditTab } from './components/InstanceTable';
 import { SeriesPanel } from './components/SeriesPanel';
+import type { FreeSlot } from './ical-engine/freewindows';
 import { addDays, downloadText, localMidnightUtcSec, ymd } from './utils/format';
 
 type ParseOutcome =
@@ -56,6 +57,8 @@ export default function App() {
   const [rightTab, setRightTab] = useState<AuditTab>('visible');
   /** 变更影响联动：被移除实例以幽灵行进入生效表 */
   const [ghostInstance, setGhostInstance] = useState<Instance | null>(null);
+  /** 空闲窗口联动定位：每次点击空档自增，触发生效表滚动到相邻事件行 */
+  const [spotlightToken, setSpotlightToken] = useState(0);
 
   const reparse = useCallback((text: string): ParseOutcome => {
     const result = parseCalendar(text);
@@ -187,6 +190,19 @@ export default function App() {
         setRightTab('visible');
         selectInstance(change.before, change.before);
       }
+    },
+    [selectInstance]
+  );
+
+  // 点击空档：切回生效实例表，选中其前（或后）相邻事件并滚动定位
+  const selectFreeSlot = useCallback(
+    (slot: FreeSlot, neighbor: Instance | null) => {
+      const target = neighbor ?? slot.previous ?? slot.next;
+      if (!target) return;
+      setRightTab('visible');
+      setGhostInstance(null);
+      setSpotlightToken((n) => n + 1);
+      selectInstance(target);
     },
     [selectInstance]
   );
@@ -474,6 +490,10 @@ export default function App() {
               ghostInstance={activeGhost}
               selectedKey={selection.instanceKey}
               onSelect={selectInstance}
+              rangeStartDate={startDate}
+              rangeEndDate={endDate}
+              onSelectSlot={selectFreeSlot}
+              spotlightToken={spotlightToken}
             />
           ) : (
             <div className="empty-hint">

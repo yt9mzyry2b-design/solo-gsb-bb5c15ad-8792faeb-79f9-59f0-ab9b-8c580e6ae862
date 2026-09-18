@@ -1,26 +1,10 @@
-import { JSDOM } from 'jsdom';
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { act } from 'react-dom/test-utils';
 import App from '../src/App';
 
 ;(async () => {
-// 临时 DOM 集成验证：挂载 App，切换到“变更影响”页签，验证空状态 / 停用例外后的差异行 / 点击联动。
-
-const dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
-  url: 'http://localhost/',
-  pretendToBeVisual: true,
-});
-(globalThis as any).window = dom.window;
-(globalThis as any).document = dom.window.document;
-(globalThis as any).navigator = dom.window.navigator;
-(globalThis as any).HTMLElement = dom.window.HTMLElement;
-(globalThis as any).Element = dom.window.Element;
-(globalThis as any).Node = dom.window.Node;
-(globalThis as any).MouseEvent = dom.window.MouseEvent;
-(globalThis as any).getComputedStyle = dom.window.getComputedStyle.bind(dom.window);
-(dom.window.HTMLElement.prototype as any).scrollIntoView = () => {};
-
+// DOM 全局对象由 jsdom-setup.cjs 通过 `node --require` 预加载提供（必须早于 react-dom 初始化）。
 const container = document.getElementById('root')!;
 const root = createRoot(container);
 
@@ -87,7 +71,6 @@ console.log('✓ 点击差异项联动实例表');
 
 // 5) 恢复例外（再次勾选），差异应清空
 await act(async () => overrideCb.click());
-await act(async () => {});
 await act(async () => impactTab.click());
 if (!container.textContent?.includes('当前范围内没有有效改动')) {
   throw new Error('恢复例外后差异应清空');
@@ -96,5 +79,8 @@ console.log('✓ 恢复后差异立即清空（重算）');
 
 root.unmount();
 console.log('✓ DOM 集成验证全部通过');
-
-})();
+process.exit(0);
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
